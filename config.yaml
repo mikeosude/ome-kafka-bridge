@@ -1,0 +1,146 @@
+# ome-kafka-bridge configuration
+# This service acts as a Kafka broker to receive OME telemetry,
+# then forwards metrics to a Prometheus remote_write endpoint and logs/events to Loki.
+
+# ─── Kafka Broker (what OME connects to) ──────────────────────────────────────
+kafka:
+  # Address this broker listens on. Point OME's "Kafka Bootstrap Server" here.
+  listen_addr: "0.0.0.0:9092"
+
+  # OME identifier prefix — must match what you configured in OME (default: ome).
+  # OME will publish to topics: <ome_identifier>.alerts, .health, .inventory,
+  # .telemetry, .auditlogs
+  ome_identifier: "ome"
+
+  # Broker advertised hostname (what OME will use to reconnect after metadata fetch)
+  advertised_host: "ome-kafka-bridge.mikeosude.com"
+  advertised_port: 9092
+
+  # Topics to consume. Leave empty to accept all topics matching ome_identifier prefix.
+  topics:
+    - "ome.alerts"
+    - "ome.health"
+    - "ome.inventory"
+    - "ome.telemetry"
+    - "ome.auditlogs"
+
+  # Auto-create topics when OME asks (set false if you pre-create them)
+  auto_create_topics: true
+
+  # Replication/partition metadata returned to OME during handshake
+  num_partitions: 1
+  replication_factor: 1
+
+# ─── Prometheus Remote Write (metrics: health, telemetry) ─────────────────────
+remote_write:
+  url: "http://metrics.mikeosude.com/api/v1/write"
+  timeout: "30s"
+
+  # Basic auth (optional)
+  # username: ""
+  # password: ""
+
+  # TLS (optional)
+  tls:
+    insecure_skip_verify: false
+    # ca_file: "/etc/ome-kafka-bridge/ca.crt"
+    # cert_file: "/etc/ome-kafka-bridge/client.crt"
+    # key_file: "/etc/ome-kafka-bridge/client.key"
+
+  # Batch settings
+  batch_size: 500
+  flush_interval: "10s"
+
+# ─── Loki (logs: alerts, auditlogs, inventory, events) ────────────────────────
+loki:
+  url: "http://metrics.mikeosude.com:3100/loki/api/v1/push"
+  timeout: "30s"
+
+  # TLS (optional)
+  tls:
+    insecure_skip_verify: false
+
+  batch_size: 100
+  flush_interval: "5s"
+
+# ─── Cache (disk-backed write-ahead queue when backends are unreachable) ───────
+cache:
+  enabled: true
+  # Directory for the on-disk WAL/queue
+  dir: "/var/lib/ome-kafka-bridge/cache"
+
+  # Max disk usage before oldest entries are dropped
+  max_size_mb: 512
+
+  # How often to retry flushing cached data
+  retry_interval: "30s"
+
+  # Maximum age of cached entries before they are discarded
+  max_age: "24h"
+
+# ─── Extra Labels (added to ALL metrics and log streams) ──────────────────────
+extra_labels:
+  environment: "production"
+  datacenter: "nyc"
+  # site: "NYCA01"
+  # team: "syseng"
+
+# ─── Relabeling Rules ─────────────────────────────────────────────────────────
+# Applied to metrics before remote_write.
+# Syntax mirrors Prometheus relabel_config.
+# Actions: keep, drop, replace, labelmap, labeldrop, labelkeep
+relabel_configs:
+  # Example: rename OME's ServiceTag label to instance
+  - source_labels: ["ServiceTag"]
+    target_label: "instance"
+    action: "replace"
+
+  # Example: drop metrics for devices in a specific group
+  # - source_labels: ["DeviceGroup"]
+  #   regex: "Lab.*"
+  #   action: "drop"
+
+  # Example: extract model family from Model label
+  # - source_labels: ["Model"]
+  #   regex: "(PowerEdge [A-Z][0-9]+).*"
+  #   target_label: "model_family"
+  #   replacement: "$1"
+  #   action: "replace"
+
+  # Drop internal OME housekeeping metrics
+  - source_labels: ["__name__"]
+    regex: "ome_internal_.*"
+    action: "drop"
+
+# ─── Log Relabeling (applied to Loki stream labels) ───────────────────────────
+log_relabel_configs:
+  - source_labels: ["severity"]
+    target_label: "level"
+    action: "replace"
+  - source_labels: ["DeviceType"]
+    target_label: "device_type"
+    action: "replace"
+
+# ─── Topic Routing ────────────────────────────────────────────────────────────
+# Control which topics go where. By default:
+#   telemetry + health  → remote_write (metrics)
+#   alerts + auditlogs  → loki (logs)
+#   inventory           → loki (logs) + optionally remote_write
+topic_routing:
+  metrics_topics:
+    - "ome.telemetry"
+    - "ome.health"
+  log_topics:
+    - "ome.alerts"
+    - "ome.auditlogs"
+    - "ome.inventory"
+
+# ─── HTTP API / Healthcheck ───────────────────────────────────────────────────
+api:
+  listen_addr: "0.0.0.0:8080"
+  # Exposes: GET /healthz, GET /metrics (self-observability), GET /cache/stats
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+log:
+  level: "info"   # debug, info, warn, error
+  format: "json"  # json, text
