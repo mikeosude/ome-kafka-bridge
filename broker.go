@@ -24,7 +24,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	cfg "github.com/ifesi/ome-kafka-bridge/internal/config"
+	cfg "github.com/mikeosude/ome-kafka-bridge/internal/config"
 )
 
 // Message is a fully decoded Kafka ProduceRequest record delivered to the

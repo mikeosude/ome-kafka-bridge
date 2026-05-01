@@ -16,11 +16,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 
-	"github.com/ifesi/ome-kafka-bridge/internal/broker"
-	"github.com/ifesi/ome-kafka-bridge/internal/cache"
-	cfg "github.com/ifesi/ome-kafka-bridge/internal/config"
-	"github.com/ifesi/ome-kafka-bridge/internal/forwarder"
-	"github.com/ifesi/ome-kafka-bridge/internal/parser"
+	"github.com/mikeosude/ome-kafka-bridge/internal/broker"
+	"github.com/mikeosude/ome-kafka-bridge/internal/cache"
+	cfg "github.com/mikeosude/ome-kafka-bridge/internal/config"
+	"github.com/mikeosude/ome-kafka-bridge/internal/forwarder"
+	"github.com/mikeosude/ome-kafka-bridge/internal/parser"
 )
 
 // ─── Self-observability metrics ───────────────────────────────────────────────
