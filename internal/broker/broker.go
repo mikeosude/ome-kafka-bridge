@@ -332,50 +332,62 @@ func (b *Broker) handleMetadata(r *reader, corrID int32, version int16) ([]byte,
 		w.writeInt32(int32(len(topics)))
 	}
 	for _, t := range topics {
-		w.writeInt16(0)
+		w.writeInt16(0) // error_code
 		if flexible {
 			w.writeCompactString(t)
 		} else {
 			w.writeString(t)
 		}
+		// topic_id: UUID (16 zero bytes) — added in v9 (KIP-516)
+		if version >= 9 {
+			w.buf = append(w.buf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+		}
 		if version >= 1 {
-			w.writeBool(false)
+			w.writeBool(false) // is_internal
 		}
 
-		// 1 partition
+		// partitions: 1 partition
 		if flexible {
 			w.writeUvarint(2)
 		} else {
 			w.writeInt32(1)
 		}
-		w.writeInt16(0) // partition error
-		w.writeInt32(0) // partition index
-		w.writeInt32(1) // leader
+		w.writeInt16(0) // partition error_code
+		w.writeInt32(0) // partition_index
+		w.writeInt32(1) // leader_id
 		if version >= 7 {
-			w.writeInt32(0) // leader epoch
+			w.writeInt32(0) // leader_epoch
 		}
-		// replicas [1]
+		// replica_nodes: [1]
 		if flexible {
 			w.writeUvarint(2)
 		} else {
 			w.writeInt32(1)
 		}
 		w.writeInt32(1)
-		// isr [1]
+		// isr_nodes: [1]
 		if flexible {
 			w.writeUvarint(2)
 		} else {
 			w.writeInt32(1)
 		}
 		w.writeInt32(1)
-		// offline []
-		if flexible {
-			w.writeUvarint(1)
-		} else {
-			w.writeInt32(0)
+		// offline_replicas: [] (v5+)
+		if version >= 5 {
+			if flexible {
+				w.writeUvarint(1)
+			} else {
+				w.writeInt32(0)
+			}
 		}
 		if flexible {
 			w.writeUvarint(0) // partition tagged fields
+		}
+		// topic_authorized_operations: int32 (v8+)
+		if version >= 8 {
+			w.writeInt32(-2147483648)
+		}
+		if flexible {
 			w.writeUvarint(0) // topic tagged fields
 		}
 	}
