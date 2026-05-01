@@ -1,16 +1,16 @@
 // Package broker implements a minimal Kafka broker sufficient for Dell
 // OpenManage Enterprise to connect to as a producer.
 //
-// OME uses the Kafka producer client (librdkafka under the hood) which performs:
-//   1. TCP connect to bootstrap server
-//   2. ApiVersions request        → we reply with supported versions
-//   3. Metadata request           → we reply with broker/topic metadata
-//   4. Produce requests           → we decode and deliver to the pipeline
+// OME uses librdkafka which negotiates ApiVersions v3 (flexible/compact encoding).
+// This implementation handles:
+//   - ApiVersions v0-v3 (including flexible encoding)
+//   - Metadata v0-v9
+//   - Produce v0-v9
+//   - SaslHandshake / SaslAuthenticate (enough to reject gracefully)
 //
-// We implement exactly these four request types (+ mandatory responses) and
-// return UNSUPPORTED_VERSION for everything else. This is enough to receive
-// all OME telemetry with PLAINTEXT security (no SASL/SSL in this version;
-// see README for how to front this with a TLS proxy).
+// Flexible encoding (KIP-482): array lengths use unsigned varints (N+1),
+// strings use unsigned varint length prefix (N+1), and each struct has a
+// trailing tagged-fields section (0x00 = empty).
 package broker
 
 import (
@@ -27,8 +27,7 @@ import (
 	cfg "github.com/mikeosude/ome-kafka-bridge/internal/config"
 )
 
-// Message is a fully decoded Kafka ProduceRequest record delivered to the
-// pipeline.
+// Message is a fully decoded Kafka ProduceRequest record.
 type Message struct {
 	Topic     string
 	Partition int32
@@ -43,17 +42,13 @@ type Broker struct {
 	log      *logrus.Logger
 	listener net.Listener
 
-	// topicSet is the set of known topics (auto-created or pre-configured).
 	mu       sync.RWMutex
 	topicSet map[string]bool
 
-	// msgCh receives decoded messages for the pipeline.
 	msgCh chan Message
-
-	done chan struct{}
+	done  chan struct{}
 }
 
-// New creates a Broker but does not start it.
 func New(c cfg.KafkaConfig, log *logrus.Logger) *Broker {
 	ts := make(map[string]bool)
 	for _, t := range c.Topics {
@@ -68,12 +63,10 @@ func New(c cfg.KafkaConfig, log *logrus.Logger) *Broker {
 	}
 }
 
-// Messages returns the channel on which decoded produce records are delivered.
 func (b *Broker) Messages() <-chan Message {
 	return b.msgCh
 }
 
-// Start begins listening for Kafka producer connections.
 func (b *Broker) Start() error {
 	ln, err := net.Listen("tcp", b.cfg.ListenAddr)
 	if err != nil {
@@ -102,8 +95,6 @@ func (b *Broker) acceptLoop() {
 	}
 }
 
-// ─── Connection handler ───────────────────────────────────────────────────────
-
 func (b *Broker) handleConn(conn net.Conn) {
 	defer conn.Close()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -118,8 +109,8 @@ func (b *Broker) handleConn(conn net.Conn) {
 		default:
 		}
 
-		// Read request length (4 bytes big-endian)
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
+
 		var size int32
 		if err := binary.Read(conn, binary.BigEndian, &size); err != nil {
 			if err != io.EOF {
@@ -128,7 +119,7 @@ func (b *Broker) handleConn(conn net.Conn) {
 			return
 		}
 		if size <= 0 || size > 32*1024*1024 {
-			b.log.WithField("size", size).Warn("invalid request size, closing connection")
+			b.log.WithField("size", size).Warn("invalid request size, closing")
 			return
 		}
 
@@ -140,14 +131,13 @@ func (b *Broker) handleConn(conn net.Conn) {
 
 		respBytes, err := b.handleRequest(body)
 		if err != nil {
-			b.log.WithError(err).Warn("handle request")
+			b.log.WithError(err).Warn("handle request error")
 			return
 		}
 		if respBytes == nil {
-			continue // no response needed
+			continue
 		}
 
-		// Write response: 4-byte length prefix + body
 		lenBuf := make([]byte, 4)
 		binary.BigEndian.PutUint32(lenBuf, uint32(len(respBytes)))
 		if _, err := conn.Write(append(lenBuf, respBytes...)); err != nil {
@@ -157,77 +147,123 @@ func (b *Broker) handleConn(conn net.Conn) {
 	}
 }
 
-// ─── Request dispatcher ───────────────────────────────────────────────────────
-
 func (b *Broker) handleRequest(body []byte) ([]byte, error) {
 	if len(body) < 4 {
-		return nil, fmt.Errorf("request too short: %d bytes", len(body))
+		return nil, fmt.Errorf("request too short")
 	}
 	r := &reader{buf: body}
 
 	apiKey := r.readInt16()
 	apiVersion := r.readInt16()
 	correlationID := r.readInt32()
-	_ = r.readString() // clientID (ignored)
+
+	isFlexible := isFlexibleVersion(apiKey, apiVersion)
+	if isFlexible {
+		r.readCompactString() // clientID
+		r.readUvarint()       // tagged fields header
+	} else {
+		r.readString() // clientID
+	}
 
 	b.log.WithFields(logrus.Fields{
-		"api_key":        apiKey,
-		"api_version":    apiVersion,
-		"correlation_id": correlationID,
-	}).Trace("kafka request")
+		"api_key":     apiKey,
+		"api_version": apiVersion,
+		"corr_id":     correlationID,
+		"flexible":    isFlexible,
+	}).Debug("kafka request")
 
 	switch apiKey {
-	case 18: // ApiVersions
+	case 18:
 		return b.handleAPIVersions(correlationID, apiVersion)
-	case 3: // Metadata
-		return b.handleMetadata(r, correlationID)
-	case 0: // Produce
+	case 3:
+		return b.handleMetadata(r, correlationID, apiVersion)
+	case 0:
 		return b.handleProduce(r, correlationID, apiVersion)
+	case 17:
+		return b.handleSaslHandshake(correlationID)
+	case 36:
+		return b.handleSaslAuthenticate(correlationID)
 	default:
-		// Return UNSUPPORTED_VERSION for everything else
+		b.log.WithField("api_key", apiKey).Debug("unsupported API key")
 		return buildErrorResponse(correlationID, 35), nil
 	}
 }
 
-// ─── ApiVersions (key 18) ─────────────────────────────────────────────────────
+func isFlexibleVersion(apiKey, apiVersion int16) bool {
+	switch apiKey {
+	case 18:
+		return apiVersion >= 3
+	case 3:
+		return apiVersion >= 9
+	case 0:
+		return apiVersion >= 9
+	default:
+		return apiVersion >= 6
+	}
+}
 
-// We advertise support for the three API keys we actually handle.
-func (b *Broker) handleAPIVersions(corrID int32, _ int16) ([]byte, error) {
+// handleAPIVersions responds to ApiVersions requests (v0-v3).
+// v3+ uses flexible/compact encoding per KIP-482.
+func (b *Broker) handleAPIVersions(corrID int32, version int16) ([]byte, error) {
+	type apiEntry struct{ key, min, max int16 }
+	supported := []apiEntry{
+		{0, 0, 8},
+		{3, 0, 9},
+		{18, 0, 3},
+		{17, 0, 1},
+		{36, 0, 2},
+	}
+
 	w := &writer{}
 	w.writeInt32(corrID)
-	w.writeInt16(0) // error code: none
+	w.writeInt16(0) // error_code: none
 
-	// Supported API keys: [apiKey, minVersion, maxVersion]
-	supported := [][3]int16{
-		{0, 0, 8},  // Produce
-		{3, 0, 9},  // Metadata
-		{18, 0, 3}, // ApiVersions
+	if version >= 3 {
+		// Flexible: compact array (N+1 uvarint)
+		w.writeUvarint(uint64(len(supported) + 1))
+		for _, e := range supported {
+			w.writeInt16(e.key)
+			w.writeInt16(e.min)
+			w.writeInt16(e.max)
+			w.writeUvarint(0) // tagged fields: empty
+		}
+		w.writeInt32(0)   // throttle_time_ms
+		w.writeUvarint(0) // tagged fields: empty
+	} else {
+		w.writeInt32(int32(len(supported)))
+		for _, e := range supported {
+			w.writeInt16(e.key)
+			w.writeInt16(e.min)
+			w.writeInt16(e.max)
+		}
+		w.writeInt32(0) // throttle_time_ms
 	}
-	w.writeInt32(int32(len(supported)))
-	for _, entry := range supported {
-		w.writeInt16(entry[0])
-		w.writeInt16(entry[1])
-		w.writeInt16(entry[2])
-	}
-	w.writeInt32(0) // throttle_time_ms
+
 	return w.bytes(), nil
 }
 
-// ─── Metadata (key 3) ─────────────────────────────────────────────────────────
+func (b *Broker) handleMetadata(r *reader, corrID int32, version int16) ([]byte, error) {
+	flexible := version >= 9
 
-func (b *Broker) handleMetadata(r *reader, corrID int32) ([]byte, error) {
-	// Parse requested topics
-	nTopics := r.readInt32()
 	var requestedTopics []string
-	for i := int32(0); i < nTopics; i++ {
-		requestedTopics = append(requestedTopics, r.readString())
+	if flexible {
+		n := int(r.readUvarint()) - 1
+		for i := 0; i < n; i++ {
+			requestedTopics = append(requestedTopics, r.readCompactString())
+			r.readUvarint()
+		}
+		r.readUvarint()
+	} else {
+		n := r.readInt32()
+		for i := int32(0); i < n; i++ {
+			requestedTopics = append(requestedTopics, r.readString())
+		}
 	}
 
-	// Auto-create topics if configured
 	if b.cfg.AutoCreateTopics {
 		b.mu.Lock()
 		for _, t := range requestedTopics {
-			if !b.topicSet[t] {
+			if t != "" && !b.topicSet[t] {
 				b.topicSet[t] = true
 				b.log.WithField("topic", t).Info("auto-created topic")
 			}
@@ -253,64 +289,144 @@ func (b *Broker) handleMetadata(r *reader, corrID int32) ([]byte, error) {
 
 	w := &writer{}
 	w.writeInt32(corrID)
+	if flexible {
+		w.writeUvarint(0) // response header tagged fields
+	}
 	w.writeInt32(0) // throttle_time_ms
 
-	// Brokers array (just us)
+	// Brokers
+	if flexible {
+		w.writeUvarint(2) // 1 broker
+	} else {
+		w.writeInt32(1)
+	}
 	w.writeInt32(1)
-	w.writeInt32(1)      // nodeId
-	w.writeString(host)  // host
+	if flexible {
+		w.writeCompactString(host)
+	} else {
+		w.writeString(host)
+	}
 	w.writeInt32(int32(port))
-	w.writeString("") // rack (nullable)
-
-	// Controller ID
-	w.writeInt32(1)
-
-	// Topics
-	w.writeInt32(int32(len(topics)))
-	for _, t := range topics {
-		w.writeInt16(0) // error code
-		w.writeString(t)
-		w.writeBool(false) // isInternal
-
-		// Partitions (1 partition per topic)
-		w.writeInt32(1)
-		w.writeInt16(0)  // partition error
-		w.writeInt32(0)  // partition index
-		w.writeInt32(1)  // leader node
-		w.writeInt32(1)  // leader epoch
-
-		// Replica nodes
-		w.writeInt32(1)
-		w.writeInt32(1)
-
-		// In-sync replicas
-		w.writeInt32(1)
-		w.writeInt32(1)
-
-		// Offline replicas
-		w.writeInt32(0)
+	if flexible {
+		w.writeUvarint(0) // rack: null
+		w.writeUvarint(0) // tagged fields
+	} else {
+		w.writeInt16(-1) // rack: null
 	}
 
-	w.writeBool(false) // cluster authorized ops
+	if version >= 2 {
+		if flexible {
+			w.writeUvarint(0) // clusterId: null
+		} else {
+			w.writeInt16(-1)
+		}
+	}
+	if version >= 1 {
+		w.writeInt32(1) // controllerId
+	}
+
+	// Topics
+	if flexible {
+		w.writeUvarint(uint64(len(topics) + 1))
+	} else {
+		w.writeInt32(int32(len(topics)))
+	}
+	for _, t := range topics {
+		w.writeInt16(0)
+		if flexible {
+			w.writeCompactString(t)
+		} else {
+			w.writeString(t)
+		}
+		if version >= 1 {
+			w.writeBool(false)
+		}
+
+		// 1 partition
+		if flexible {
+			w.writeUvarint(2)
+		} else {
+			w.writeInt32(1)
+		}
+		w.writeInt16(0) // partition error
+		w.writeInt32(0) // partition index
+		w.writeInt32(1) // leader
+		if version >= 7 {
+			w.writeInt32(0) // leader epoch
+		}
+		// replicas [1]
+		if flexible {
+			w.writeUvarint(2)
+		} else {
+			w.writeInt32(1)
+		}
+		w.writeInt32(1)
+		// isr [1]
+		if flexible {
+			w.writeUvarint(2)
+		} else {
+			w.writeInt32(1)
+		}
+		w.writeInt32(1)
+		// offline []
+		if flexible {
+			w.writeUvarint(1)
+		} else {
+			w.writeInt32(0)
+		}
+		if flexible {
+			w.writeUvarint(0) // partition tagged fields
+			w.writeUvarint(0) // topic tagged fields
+		}
+	}
+
+	if version >= 8 {
+		w.writeInt32(0) // cluster authorized ops
+	}
+	if flexible {
+		w.writeUvarint(0) // response tagged fields
+	}
+
 	return w.bytes(), nil
 }
 
-// ─── Produce (key 0) ──────────────────────────────────────────────────────────
-
 func (b *Broker) handleProduce(r *reader, corrID int32, apiVersion int16) ([]byte, error) {
-	_ = r.readInt16() // transactional_id (nullable, skip)
-	_ = r.readInt16() // acks
-	_ = r.readInt32() // timeout_ms
+	flexible := apiVersion >= 9
 
-	nTopics := r.readInt32()
+	if flexible {
+		r.readCompactNullableString()
+	} else {
+		r.readString()
+	}
+	_ = r.readInt16()
+	_ = r.readInt32()
+
+	var nTopics int32
+	if flexible {
+		nTopics = int32(r.readUvarint()) - 1
+	} else {
+		nTopics = r.readInt32()
+	}
+
 	for i := int32(0); i < nTopics; i++ {
-		topic := r.readString()
-		nPartitions := r.readInt32()
+		var topic string
+		if flexible {
+			topic = r.readCompactString()
+		} else {
+			topic = r.readString()
+		}
+
+		var nPartitions int32
+		if flexible {
+			nPartitions = int32(r.readUvarint()) - 1
+		} else {
+			nPartitions = r.readInt32()
+		}
+
 		for j := int32(0); j < nPartitions; j++ {
 			partition := r.readInt32()
-			_ = r.readInt32() // record_set size (bytes)
+			_ = r.readInt32()
 
-			// Decode MessageSet / RecordBatch
 			msgs, err := b.decodeRecordBatch(r, topic, partition, apiVersion)
 			if err != nil {
 				b.log.WithError(err).WithField("topic", topic).Warn("decode record batch")
@@ -323,121 +439,121 @@ func (b *Broker) handleProduce(r *reader, corrID int32, apiVersion int16) ([]byt
 					b.log.Warn("message channel full, dropping record")
 				}
 			}
+			if flexible {
+				r.readUvarint()
+			}
+		}
+		if flexible {
+			r.readUvarint()
 		}
 	}
+	if flexible {
+		r.readUvarint()
+	}
 
-	// Produce response
 	w := &writer{}
 	w.writeInt32(corrID)
+	if flexible {
+		w.writeUvarint(0)
+	}
 	w.writeInt32(0) // throttle_time_ms
-
-	// We acknowledge all produce responses as success (offset 0)
-	// OME only checks for connection/error, not exact offsets.
+	if flexible {
+		w.writeUvarint(1) // empty compact array
+		w.writeUvarint(0) // tagged fields
+	} else {
+		w.writeInt32(0)
+	}
 	return w.bytes(), nil
 }
 
-// decodeRecordBatch handles Kafka RecordBatch format (magic byte 2, API v3+)
-// and falls back to legacy MessageSet (magic byte 0/1).
-func (b *Broker) decodeRecordBatch(r *reader, topic string, partition int32, _ int16) ([]Message, error) {
-	// Peek magic byte: in RecordBatch format, magic is at offset 16 of the batch.
-	// Since r already points past the size field, save position.
-	pos := r.pos
+func (b *Broker) handleSaslHandshake(corrID int32) ([]byte, error) {
+	w := &writer{}
+	w.writeInt32(corrID)
+	w.writeInt16(33) // UNSUPPORTED_SASL_MECHANISM
+	w.writeInt32(0)
+	return w.bytes(), nil
+}
 
-	// Try RecordBatch (magic = 2)
-	// Format: baseOffset(8) + batchLength(4) + partitionLeaderEpoch(4) + magic(1)
+func (b *Broker) handleSaslAuthenticate(corrID int32) ([]byte, error) {
+	w := &writer{}
+	w.writeInt32(corrID)
+	w.writeInt16(58) // SASL_AUTHENTICATION_FAILED
+	w.writeInt16(-1)
+	w.writeInt32(-1)
+	return w.bytes(), nil
+}
+
+// ─── Record batch decoder ─────────────────────────────────────────────────────
+
+func (b *Broker) decodeRecordBatch(r *reader, topic string, partition int32, _ int16) ([]Message, error) {
 	if r.remaining() < 17 {
 		return nil, nil
 	}
-	_ = r.readInt64() // baseOffset
-	_ = r.readInt32() // batchLength
-	_ = r.readInt32() // partitionLeaderEpoch
+	pos := r.pos
+	_ = r.readInt64()
+	_ = r.readInt32()
+	_ = r.readInt32()
 	magic := r.readInt8()
 
 	if magic == 2 {
 		return b.decodeRecordBatchV2(r, topic, partition)
 	}
-
-	// Legacy MessageSet (magic 0 or 1)
 	r.pos = pos
 	return b.decodeLegacyMessageSet(r, topic, partition)
 }
 
-// decodeRecordBatchV2 decodes a Kafka RecordBatch (magic=2).
 func (b *Broker) decodeRecordBatchV2(r *reader, topic string, partition int32) ([]Message, error) {
-	_ = r.readInt16() // attributes
-	_ = r.readInt32() // lastOffsetDelta
+	_ = r.readInt16()
+	_ = r.readInt32()
 	baseTimestamp := r.readInt64()
-	_ = r.readInt64() // maxTimestamp
-	_ = r.readInt64() // producerId
-	_ = r.readInt16() // producerEpoch
-	_ = r.readInt32() // baseSequence
+	_ = r.readInt64()
+	_ = r.readInt64()
+	_ = r.readInt16()
+	_ = r.readInt32()
 
 	nRecords := r.readInt32()
 	msgs := make([]Message, 0, nRecords)
-
 	for i := int32(0); i < nRecords && r.remaining() > 0; i++ {
-		_ = r.readVarint()          // record length
-		_ = r.readInt8()            // attributes
-		_ = r.readVarint()          // timestampDelta
-		_ = r.readVarint()          // offsetDelta
-		key := r.readVarBytes()     // key
-		value := r.readVarBytes()   // value
-		nHeaders := r.readVarint()  // headers
-		for h := int64(0); h < nHeaders; h++ {
+		_ = r.readVarint()
+		_ = r.readInt8()
+		_ = r.readVarint()
+		_ = r.readVarint()
+		key := r.readVarBytes()
+		value := r.readVarBytes()
+		nH := r.readVarint()
+		for h := int64(0); h < nH; h++ {
 			r.readVarBytes()
 			r.readVarBytes()
 		}
-
 		msgs = append(msgs, Message{
-			Topic:     topic,
-			Partition: partition,
-			Key:       key,
-			Value:     value,
+			Topic: topic, Partition: partition,
+			Key: key, Value: value,
 			Timestamp: time.UnixMilli(baseTimestamp),
 		})
 	}
 	return msgs, nil
 }
 
-// decodeLegacyMessageSet decodes old-style MessageSet.
 func (b *Broker) decodeLegacyMessageSet(r *reader, topic string, partition int32) ([]Message, error) {
 	var msgs []Message
-	for r.remaining() > 0 {
-		if r.remaining() < 12 {
-			break
-		}
-		_ = r.readInt64()   // offset
+	for r.remaining() >= 12 {
+		_ = r.readInt64()
 		size := r.readInt32()
-		if int(size) > r.remaining() {
+		if size <= 0 || int(size) > r.remaining() {
 			break
 		}
-		msgStart := r.pos
-		_ = r.readInt32()   // crc
-		_ = r.readInt8()    // magic
-		attrs := r.readInt8()
-		_ = attrs // compression not handled in bridge
-
-		var ts time.Time
-		// magic 1 has timestamp
-		// We already consumed magic above, just use now
-		ts = time.Now()
-
+		_ = r.readInt32()
+		_ = r.readInt8()
+		_ = r.readInt8()
 		key := r.readBytes()
 		value := r.readBytes()
-
-		_ = msgStart // consumed
 		msgs = append(msgs, Message{
-			Topic:     topic,
-			Partition: partition,
-			Key:       key,
-			Value:     value,
-			Timestamp: ts,
+			Topic: topic, Partition: partition,
+			Key: key, Value: value, Timestamp: time.Now(),
 		})
 	}
 	return msgs, nil
 }
-
-// ─── Low-level helpers ────────────────────────────────────────────────────────
 
 func buildErrorResponse(corrID int32, errCode int16) []byte {
 	w := &writer{}
@@ -446,7 +562,6 @@ func buildErrorResponse(corrID int32, errCode int16) []byte {
 	return w.bytes()
 }
 
-// Close shuts down the broker.
 func (b *Broker) Close() {
 	close(b.done)
 	if b.listener != nil {
@@ -461,9 +576,7 @@ type reader struct {
 	pos int
 }
 
-func (r *reader) remaining() int {
-	return len(r.buf) - r.pos
-}
+func (r *reader) remaining() int { return len(r.buf) - r.pos }
 
 func (r *reader) readInt8() int8 {
 	if r.pos >= len(r.buf) {
@@ -503,10 +616,7 @@ func (r *reader) readInt64() int64 {
 
 func (r *reader) readString() string {
 	n := r.readInt16()
-	if n < 0 {
-		return "" // nullable
-	}
-	if r.pos+int(n) > len(r.buf) {
+	if n < 0 || r.pos+int(n) > len(r.buf) {
 		return ""
 	}
 	s := string(r.buf[r.pos : r.pos+int(n)])
@@ -514,12 +624,29 @@ func (r *reader) readString() string {
 	return s
 }
 
+func (r *reader) readCompactString() string {
+	n := int(r.readUvarint()) - 1
+	if n < 0 || r.pos+n > len(r.buf) {
+		return ""
+	}
+	s := string(r.buf[r.pos : r.pos+n])
+	r.pos += n
+	return s
+}
+
+func (r *reader) readCompactNullableString() string {
+	n := int(r.readUvarint()) - 1
+	if n < 0 || r.pos+n > len(r.buf) {
+		return ""
+	}
+	s := string(r.buf[r.pos : r.pos+n])
+	r.pos += n
+	return s
+}
+
 func (r *reader) readBytes() []byte {
 	n := r.readInt32()
-	if n < 0 {
-		return nil
-	}
-	if r.pos+int(n) > len(r.buf) {
+	if n < 0 || r.pos+int(n) > len(r.buf) {
 		return nil
 	}
 	b := make([]byte, n)
@@ -528,18 +655,25 @@ func (r *reader) readBytes() []byte {
 	return b
 }
 
+func (r *reader) readUvarint() uint64 {
+	v, n := binary.Uvarint(r.buf[r.pos:])
+	if n > 0 {
+		r.pos += n
+	}
+	return v
+}
+
 func (r *reader) readVarint() int64 {
 	v, n := binary.Varint(r.buf[r.pos:])
-	r.pos += n
+	if n > 0 {
+		r.pos += n
+	}
 	return v
 }
 
 func (r *reader) readVarBytes() []byte {
 	n := r.readVarint()
-	if n < 0 {
-		return nil
-	}
-	if r.pos+int(n) > len(r.buf) {
+	if n < 0 || r.pos+int(n) > len(r.buf) {
 		return nil
 	}
 	b := make([]byte, n)
@@ -550,49 +684,61 @@ func (r *reader) readVarBytes() []byte {
 
 // ─── Binary writer ────────────────────────────────────────────────────────────
 
-type writer struct {
-	buf []byte
-}
+type writer struct{ buf []byte }
 
-func (w *writer) writeInt8(v int8) {
-	w.buf = append(w.buf, byte(v))
-}
-
-func (w *writer) writeInt16(v int16) {
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, uint16(v))
-	w.buf = append(w.buf, b...)
-}
-
-func (w *writer) writeInt32(v int32) {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, uint32(v))
-	w.buf = append(w.buf, b...)
-}
-
-func (w *writer) writeString(s string) {
-	if s == "" {
-		w.writeInt16(-1) // nullable
-		return
-	}
-	w.writeInt16(int16(len(s)))
-	w.buf = append(w.buf, s...)
-}
-
-func (w *writer) writeBool(v bool) {
+func (w *writer) writeInt8(v int8)  { w.buf = append(w.buf, byte(v)) }
+func (w *writer) writeBool(v bool)  {
 	if v {
 		w.writeInt8(1)
 	} else {
 		w.writeInt8(0)
 	}
 }
+func (w *writer) bytes() []byte { return w.buf }
 
-func (w *writer) bytes() []byte {
-	return w.buf
+func (w *writer) writeInt16(v int16) {
+	b := [2]byte{}
+	binary.BigEndian.PutUint16(b[:], uint16(v))
+	w.buf = append(w.buf, b[:]...)
+}
+
+func (w *writer) writeInt32(v int32) {
+	b := [4]byte{}
+	binary.BigEndian.PutUint32(b[:], uint32(v))
+	w.buf = append(w.buf, b[:]...)
 }
 
 func (w *writer) writeInt64(v int64) {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, uint64(v))
-	w.buf = append(w.buf, b...)
+	b := [8]byte{}
+	binary.BigEndian.PutUint64(b[:], uint64(v))
+	w.buf = append(w.buf, b[:]...)
+}
+
+func (w *writer) writeString(s string) {
+	if s == "" {
+		w.writeInt16(-1)
+		return
+	}
+	w.writeInt16(int16(len(s)))
+	w.buf = append(w.buf, s...)
+}
+
+func (w *writer) writeCompactString(s string) {
+	w.writeUvarint(uint64(len(s) + 1))
+	w.buf = append(w.buf, s...)
+}
+
+func (w *writer) writeCompactNullableString(s string) {
+	if s == "" {
+		w.writeUvarint(0)
+		return
+	}
+	w.writeUvarint(uint64(len(s) + 1))
+	w.buf = append(w.buf, s...)
+}
+
+func (w *writer) writeUvarint(v uint64) {
+	var tmp [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(tmp[:], v)
+	w.buf = append(w.buf, tmp[:n]...)
 }

@@ -13,7 +13,7 @@ kafka:
   ome_identifier: "ome"
 
   # Broker advertised hostname (what OME will use to reconnect after metadata fetch)
-  advertised_host: "ome-kafka-bridge.mikeosude.com"
+  advertised_host: "ome-kafka-bridge.domain.com"
   advertised_port: 9092
 
   # Topics to consume. Leave empty to accept all topics matching ome_identifier prefix.
@@ -33,7 +33,7 @@ kafka:
 
 # ─── Prometheus Remote Write (metrics: health, telemetry) ─────────────────────
 remote_write:
-  url: "http://metrics.mikeosude.com/api/v1/write"
+  url: "http://metrics.domain.com/api/v1/write"
   timeout: "30s"
 
   # Basic auth (optional)
@@ -53,7 +53,7 @@ remote_write:
 
 # ─── Loki (logs: alerts, auditlogs, inventory, events) ────────────────────────
 loki:
-  url: "http://metrics.mikeosude.com:3100/loki/api/v1/push"
+  url: "http://metrics.domain.com:3100/loki/api/v1/push"
   timeout: "30s"
 
   # TLS (optional)
