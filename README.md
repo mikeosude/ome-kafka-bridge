@@ -71,14 +71,14 @@ Edit `config.yaml`. Key settings:
 ```yaml
 kafka:
   listen_addr: "0.0.0.0:9092"
-  advertised_host: "ome-kafka-bridge.mikeosude.com"   # what OME reconnects to
+  advertised_host: ""   # what OME reconnects to
   ome_identifier: "ome"
 
 remote_write:
-  url: "http://metrics.mikeosude.com/api/v1/write"
+  url: "[remote write url]"
 
 loki:
-  url: "http://metrics.mikeosude.com:3100/loki/api/v1/push"
+  url: "[loki url]"
 ```
 
 ### 3. Run
@@ -94,7 +94,7 @@ In OME → Configuration → Remote Connectivity → Kafka Connectivity:
 | Field                    | Value                                      |
 |--------------------------|--------------------------------------------|
 | OME Identifier           | `ome`                                      |
-| Kafka Bootstrap Server   | `ome-kafka-bridge.mikeosude.com:9092`      |
+| Kafka Bootstrap Server   | `[the fqdn]:9092`      |
 | Authentication Mode      | `None`                                     |
 
 Click through to Data Configuration and select the desired data types.
